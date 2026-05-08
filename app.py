@@ -32,7 +32,7 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
-    for key in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is", "has_city"]:
+    for key in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]:
         if key in st.session_state:
             del st.session_state[key]
 
@@ -71,7 +71,7 @@ def sniff_numeric(df: pd.DataFrame, col: str) -> bool:
     return pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6
 
 # ── Core Processing Engine (POLARS - Rust Powered) ────────────────────────────
-def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_col, f2f_col, status_text):
+def process_with_polars(path_a, path_b, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_col, f2f_col, status_text):
     
     def load_pl(path):
         if path.endswith(".parquet"): return pl.read_parquet(path)
@@ -84,27 +84,8 @@ def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, gr
     # Standardize column names to lowercase
     df_a = df_a.rename({c: c.strip().lower() for c in df_a.columns})
     df_b = df_b.rename({c: c.strip().lower() for c in df_b.columns})
-    
-    has_city = False
 
-    # 1. OPTIONAL FILE 3: CITY MAPPING
-    if path_c:
-        status_text.markdown("**⏳ Mapping Cities to Data...**")
-        df_c = load_pl(path_c).rename({c: c.strip().lower() for c in load_pl(path_c).columns})
-        if "city" in df_c.columns and "ph_name" in df_c.columns:
-            has_city = True
-            df_c = df_c.select(["ph_name", "city"]).unique("ph_name")
-            
-            # Left join city onto A and B where ph_name matches
-            if "ph_name" in df_a.columns: df_a = df_a.join(df_c, on="ph_name", how="left")
-            if "ph_name" in df_b.columns: df_b = df_b.join(df_c, on="ph_name", how="left")
-            
-            # Ensure city is treated as a context column to be coalesced later
-            if "city" not in key_cols:
-                if "city" not in df_a.columns: df_a = df_a.with_columns(pl.lit(None).alias("city"))
-                if "city" not in df_b.columns: df_b = df_b.with_columns(pl.lit(None).alias("city"))
-
-    # 2. COMPUTED SLA
+    # COMPUTED SLA
     if "Compute" in metric_strat:
         status_text.markdown("**⏳ Calculating Derived SLAs...**")
         df_a = df_a.with_columns(((pl.col(sla_col).cast(pl.Float64, strict=False) - pl.col(f2f_col).cast(pl.Float64, strict=False)) / 24).round(0).alias(val_col))
@@ -113,7 +94,7 @@ def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, gr
         df_a = df_a.with_columns(pl.col(val_col).cast(pl.Float64, strict=False))
         df_b = df_b.with_columns(pl.col(val_col).cast(pl.Float64, strict=False))
 
-    # 3. COMPOSITE KEYS & DEDUPLICATION
+    # COMPOSITE KEYS & DEDUPLICATION
     status_text.markdown("**⏳ Generating Keys & Deduplicating...**")
     df_a = df_a.with_columns(pl.concat_str(key_cols, separator="-").alias("__key__"))
     df_b = df_b.with_columns(pl.concat_str(key_cols, separator="-").alias("__key__"))
@@ -122,11 +103,11 @@ def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, gr
         df_a = df_a.unique(subset=["__key__"], keep="first")
         df_b = df_b.unique(subset=["__key__"], keep="first")
 
-    # 4. THE OUTER JOIN (Polars handles 2M rows instantly)
+    # THE OUTER JOIN (Polars handles 2M rows instantly)
     status_text.markdown("**⏳ Performing Full Comparison Join...**")
     merged = df_a.join(df_b, on="__key__", how="full", suffix="_B")
 
-    # 5. METRICS & STATUS
+    # METRICS & STATUS
     status_text.markdown("**⏳ Calculating Statuses...**")
     vA = pl.col(val_col)
     vB = pl.col(f"{val_col}_B")
@@ -146,19 +127,25 @@ def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, gr
         .otherwise(pl.lit("Same")).alias("Status")
     )
 
-    # 6. COALESCE CONTEXT COLUMNS
+    # COALESCE CONTEXT COLUMNS & ORGANIZE
     status_text.markdown("**⏳ Finalizing Dataset...**")
+    
+    # Consolidate all common columns dynamically
+    all_cols_a = df_a.columns
+    all_cols_b = df_b.columns
+    context_cols = [c for c in all_cols_a if c in all_cols_b and c not in key_cols and c != val_col and c != "__key__"]
+    
+    for c in context_cols:
+        merged = merged.with_columns(pl.coalesce([pl.col(c), pl.col(f"{c}_B")]).alias(c))
+
     base_cols = ["__key__", val_col, f"{val_col}_B", "Δ Change", "Status"]
+    
     if grp_col and grp_col != "(none)":
-        merged = merged.with_columns(pl.coalesce([pl.col(grp_col), pl.col(f"{grp_col}_B")]).fill_null("Unknown").alias("Group"))
+        merged = merged.with_columns(pl.col(grp_col).fill_null("Unknown").alias("Group"))
         base_cols.append("Group")
     else:
         merged = merged.with_columns(pl.lit("All").alias("Group"))
         base_cols.append("Group")
-        
-    if has_city:
-        merged = merged.with_columns(pl.coalesce([pl.col("city"), pl.col("city_B")]).alias("city"))
-        base_cols.append("city")
 
     # Rename for output
     key_display = "-".join(key_cols)
@@ -168,19 +155,17 @@ def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, gr
         f"{val_col}_B": f"{val_col} (File B)"
     })
     
-    final_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-    if has_city: final_cols.append("city")
+    final_cols = base_cols + [c for c in merged.columns if c not in base_cols and not c.endswith("_B")]
+    merged = merged.select(final_cols)
 
-    merged = merged.select([c for c in final_cols if c in merged.columns])
-
-    # 7. SAVE TO DISK
+    # SAVE TO DISK
     out_parquet = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet").name
     merged.write_parquet(out_parquet)
     
     status_counts = merged["Status"].value_counts().to_pandas().set_index("Status")["count"].to_dict()
     total_rows = len(merged)
     
-    return out_parquet, status_counts, total_rows, has_city
+    return out_parquet, status_counts, total_rows
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
@@ -197,11 +182,6 @@ with st.container(border=True):
     with c2:
         st.markdown("**📁 File B — Current / New**")
         up_b = st.file_uploader("File B", type=["csv", "xlsx", "parquet"], key="fb", label_visibility="collapsed", on_change=reset_computation)
-    
-    st.markdown("---")
-    st.markdown("**📁 File 3 (Optional) — City Mapping**")
-    st.caption("Upload a file with `ph_name` and `city` columns to append City data for post-analysis filtering.")
-    up_c = st.file_uploader("File 3", type=["csv", "xlsx", "parquet"], key="fc", label_visibility="collapsed", on_change=reset_computation)
 
 if not (up_a and up_b):
     st.info("⬆ Upload File A and File B to begin.", icon="ℹ️")
@@ -260,20 +240,18 @@ if run:
     status_text.markdown("**⏳ Securing files to disk to prevent RAM overflow...**")
     path_a = write_upload_to_temp(up_a)
     path_b = write_upload_to_temp(up_b)
-    path_c = write_upload_to_temp(up_c) if up_c else None
 
     # Run Polars Engine
-    out_path, counts, total, has_city = process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_hrs_col if "Compute" in metric_strat else None, f2f_hrs_col if "Compute" in metric_strat else None, status_text)
+    out_path, counts, total = process_with_polars(path_a, path_b, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_hrs_col if "Compute" in metric_strat else None, f2f_hrs_col if "Compute" in metric_strat else None, status_text)
         
-    st.session_state.update({"results_path": out_path, "status_counts": counts, "total_rows": total, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is, "has_city": has_city})
+    st.session_state.update({"results_path": out_path, "status_counts": counts, "total_rows": total, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
     
     # Cleanup temp raw files
     os.remove(path_a); os.remove(path_b)
-    if path_c: os.remove(path_c)
     gc.collect()
     status_text.empty()
 
-results_path, status_counts, total_rows, key_cols, val_col, grp_col, higher_is, has_city = [st.session_state[k] for k in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is", "has_city"]]
+results_path, status_counts, total_rows, key_cols, val_col, grp_col, higher_is = [st.session_state[k] for k in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]]
 
 cols_m = st.columns(6)
 cols_m[0].metric("Total Rows Evaluated", f"{total_rows:,}")
@@ -295,35 +273,41 @@ with tab_export:
     st.markdown("#### Extract & Download Data")
     
     try:
-        # Load the massive dataset lazily to prevent RAM spike during export prep
+        # Load the massive dataset lazily
         lazy_df = pl.scan_parquet(results_path)
+        all_columns = lazy_df.columns
         
-        # City Filter UI (Only shows if File 3 was uploaded and matched successfully)
-        selected_cities = []
-        if has_city:
-            unique_cities = lazy_df.select("city").drop_nulls().unique().collect().to_series().to_list()
-            unique_cities = sorted([str(c) for c in unique_cities])
+        st.markdown("**🎯 Dynamic Data Filter**")
+        filter_col = st.selectbox("1. Select a column to filter by (Optional):", ["(none)"] + all_columns)
+        
+        selected_vals = []
+        if filter_col != "(none)":
+            with st.spinner(f"Fetching unique values for {filter_col}..."):
+                unique_vals = lazy_df.select(filter_col).drop_nulls().unique().collect().to_series().to_list()
+                unique_vals = sorted([str(v) for v in unique_vals])
             
-            st.markdown("**🏙️ Filter Output by City**")
-            selected_cities = st.multiselect("Select Cities to include (Leave empty to download ALL rows):", options=unique_cities)
+            selected_vals = st.multiselect(f"2. Select values to include from '{filter_col}' (Leave empty for ALL rows):", options=unique_vals)
         
-        # Generate the final CSV string dynamically based on the filter
-        if st.button("🔄 Generate CSV File for Download"):
-            with st.spinner("Preparing your CSV..."):
-                if selected_cities:
-                    final_export = lazy_df.filter(pl.col("city").is_in(selected_cities)).collect()
-                else:
-                    final_export = lazy_df.collect()
-                    
-                csv_bytes = final_export.write_csv().encode('utf-8')
+        # Stream the final CSV directly to disk to prevent OOM errors on Download
+        if st.button("🔄 Generate CSV File for Download", type="primary"):
+            with st.spinner("Preparing your CSV... This may take a moment for large files."):
                 
-                st.download_button(
-                    label=f"⬇️ Download Output ({len(final_export):,} rows)", 
-                    data=csv_bytes, 
-                    file_name=f"SLA_Report_Filtered.csv", 
-                    mime="text/csv", 
-                    type="primary"
-                )
+                export_df = lazy_df
+                if filter_col != "(none)" and selected_vals:
+                    export_df = export_df.filter(pl.col(filter_col).cast(pl.Utf8).is_in(selected_vals))
+                
+                # Sink directly to a temp CSV file to preserve RAM
+                out_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
+                export_df.sink_csv(out_csv)
+                
+                with open(out_csv, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download Filtered Output", 
+                        data=f, 
+                        file_name=f"SLA_Report_Filtered.csv", 
+                        mime="text/csv", 
+                        type="primary"
+                    )
                 
     except Exception as e:
         st.error(f"Error accessing output: {e}")
