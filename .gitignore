@@ -1,0 +1,13 @@
+# Environments
+venv/
+.env/
+
+# Data files
+*.csv
+*.xlsx
+*.parquet
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
