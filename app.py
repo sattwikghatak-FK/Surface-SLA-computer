@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import tempfile
+import os
 import gc
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -29,7 +31,7 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is"]:
+    for key in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]:
         if key in st.session_state:
             del st.session_state[key]
 
@@ -48,9 +50,15 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     df.dropna(how="all", inplace=True)
     df.dropna(axis=1, how="all", inplace=True)
+    
     str_cols = df.select_dtypes(include=["object", "string"]).columns
     for c in str_cols:
         df[c] = df[c].str.strip()
+        # AGGRESSIVE MEMORY COMPRESSION FOR 20+ LAKH ROWS:
+        # If a string column has fewer unique values than 50% of the dataset size, compress it to a category.
+        if df[c].nunique() < (len(df) * 0.5):
+            df[c] = df[c].astype("category")
+            
     df.replace("", np.nan, inplace=True)
     return df
 
@@ -71,27 +79,18 @@ def get_sheet_names(file) -> list:
     return xls.sheet_names
     
 def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    """Loads just a tiny chunk of data directly from disk to populate the UI dropdowns quickly."""
     file.seek(0)
-    if file_name.lower().endswith('.parquet'):
-        df = pd.read_parquet(file).head(1500)
-    elif file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=1500)
-    else:
-        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=1500)
+    if file_name.lower().endswith('.parquet'): df = pd.read_parquet(file).head(1500)
+    elif file_name.lower().endswith('.xlsx'): df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=1500)
+    else: df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=1500)
     return clean_df(df)
 
 def load_full_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    """Loads the full dataset straight from Streamlit's disk cache without byte duplication."""
     file.seek(0)
-    if file_name.lower().endswith('.parquet'):
-        df = pd.read_parquet(file)
-    elif file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
-    else:
-        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
+    if file_name.lower().endswith('.parquet'): df = pd.read_parquet(file)
+    elif file_name.lower().endswith('.xlsx'): df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
+    else: df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
-
 
 def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
     vals = df[col].dropna().head(sample)
@@ -101,12 +100,11 @@ def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
 def make_key(df, cols):
     if len(cols) == 1: return df[cols[0]].astype(str)
     res = df[cols[0]].astype(str)
-    for col in cols[1:]:
-        res += "-" + df[col].astype(str)
+    for col in cols[1:]: res += "-" + df[col].astype(str)
     return res
 
-# ── Unified Chunk Processing Engine ───────────────────────────────────────────
-def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None) -> pd.DataFrame:
+# ── Unified Chunk Processing Engine (Direct-to-Disk Streaming) ────────────────
+def process_comparison_streamed(df_a, df_b, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None):
     def update_ui(msg, pct):
         if status_text: status_text.markdown(f"**⏳ {msg}**")
         if progress_bar: progress_bar.progress(pct)
@@ -116,30 +114,34 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
     only_a = [c for c in cols_a_all if c not in cols_b_all]
     only_b = [c for c in cols_b_all if c not in cols_a_all]
 
-    update_ui("Generating composite keys...", 55)
+    update_ui("Generating composite keys...", 45)
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
-    update_ui("Preparing memory chunks...", 60)
+    update_ui("Preparing memory chunks...", 50)
     all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
     
-    # Lowered chunk size to 15,000 for extreme memory safety on cloud servers
-    CHUNK_SIZE = 15000  
+    CHUNK_SIZE = 25000  
     num_chunks = max(1, len(all_keys) // CHUNK_SIZE + (1 if len(all_keys) % CHUNK_SIZE != 0 else 0))
     
-    processed_chunks = []
     is_strict = "1-to-1" in comp_mode
     dedup_a, dedup_b = True, True
     if not is_strict:
         if "File B" in granular_file: dedup_b = False
         else: dedup_a = False
 
+    # Create a temporary file to stream the output to disk
+    out_csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
+    
+    status_counts = {"Degraded": 0, "Improved": 0, "Same": 0, "New": 0, "Removed": 0}
+    total_rows = 0
+    key_display = "-".join(key_cols)
+
     for i in range(num_chunks):
-        chunk_pct = 60 + int(30 * (i / num_chunks)) 
-        update_ui(f"Calculating chunk {i+1} of {num_chunks} ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} identifiers)...", chunk_pct)
+        chunk_pct = 50 + int(45 * (i / num_chunks)) 
+        update_ui(f"Streaming chunk {i+1} of {num_chunks} to disk ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} keys)...", chunk_pct)
         
         chunk_keys = all_keys[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
-        
         sub_a = df_a[df_a["__key__"].isin(chunk_keys)].copy()
         sub_b = df_b[df_b["__key__"].isin(chunk_keys)].copy()
         
@@ -164,6 +166,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
             ["New", "Removed", "Degraded", "Improved"], default="Same"
         )
 
+        # Dynamic Column Coalescing
         for c in [c for c in common_cols if c not in ["__key__", val_col]]:
             col_a, col_b = f"{c}_A", f"{c}_B"
             if col_a in merged.columns and col_b in merged.columns:
@@ -174,26 +177,40 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
             elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
             elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
 
-        if not merged.empty: processed_chunks.append(merged)
+        if merged.empty:
+            continue
+
+        merged["Group"] = merged[grp_col].fillna("Unknown") if grp_col and grp_col in merged.columns else "All"
+        merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
+
+        # Column Ordering
+        base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
+        all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in [key_display, val_col]]
+        context_cols = list(dict.fromkeys([c for c in all_context if c in merged.columns]))
+        
+        final_cols = [c for c in base_cols + context_cols if c in merged.columns]
+        merged = merged[final_cols]
+        
+        if not is_strict: 
+            merged = merged.drop_duplicates()
+
+        # Tally metrics dynamically without keeping data in RAM
+        sc = merged["Status"].value_counts().to_dict()
+        for s in status_counts.keys():
+            status_counts[s] += sc.get(s, 0)
+        total_rows += len(merged)
+
+        # Append directly to the disk file
+        if i == 0:
+            merged.to_csv(out_csv_path, index=False)
+        else:
+            merged.to_csv(out_csv_path, mode='a', header=False, index=False)
         
         del sub_a, sub_b, merged
         gc.collect()
 
-    update_ui("Assembling final dataset...", 95)
-    final_merged = pd.concat(processed_chunks, ignore_index=True) if processed_chunks else pd.DataFrame() 
-    final_merged["Group"] = final_merged[grp_col].fillna("Unknown") if grp_col and grp_col in final_merged.columns else "All"
-    
-    key_display = "-".join(key_cols) 
-    final_merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
-
-    base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-    all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in ["__key__", val_col]]
-    context_cols = list(dict.fromkeys([c for c in all_context if c in final_merged.columns]))
-    
-    if not is_strict: final_merged = final_merged.drop_duplicates()
-        
     update_ui("Analysis Complete! 🚀", 100)
-    return final_merged[[c for c in base_cols + context_cols if c in final_merged.columns]]
+    return out_csv_path, status_counts, total_rows
 
 # ── Styler ────────────────────────────────────────────────────────────────────
 def style_table(df: pd.DataFrame):
@@ -234,7 +251,6 @@ if not (up_a and up_b):
     st.stop()
 
 with st.spinner("Extracting headers..."):
-    # Generate previews natively using the file object, completely skipping RAM-heavy bytes conversion
     df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
     df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
 
@@ -290,7 +306,7 @@ with st.container(border=True):
     run_disabled = not key_cols or (metric_strat.startswith("Compute") and (not sla_hrs_col or not f2f_hrs_col or not val_col))
     run = st.button("🚀 Run Full Analysis", type="primary", width="stretch", disabled=run_disabled)
 
-if not run and "results" not in st.session_state:
+if not run and "results_path" not in st.session_state:
     st.stop()
 
 if run:
@@ -298,25 +314,23 @@ if run:
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    # Load A and explicitly clean RAM before moving to B
-    status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**")
+    # Load A and explicit memory clearing
+    status_text.markdown(f"**⏳ Reading {up_a.name} into memory and compressing...**")
     progress_bar.progress(10)
     df_a_working = load_full_data(up_a, up_a.name, sheet_a)
     gc.collect() 
     
-    # Load B
-    status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**")
-    progress_bar.progress(35)
+    # Load B and explicit memory clearing
+    status_text.markdown(f"**⏳ Reading {up_b.name} into memory and compressing...**")
+    progress_bar.progress(25)
     df_b_working = load_full_data(up_b, up_b.name, sheet_b)
     gc.collect()
 
-    # Map File B columns
     df_b_working.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
     
-    # Inject the custom Computed Metric if selected
     if "Compute Derived SLA" in metric_strat:
         status_text.markdown(f"**⏳ Computing {val_col}...**")
-        progress_bar.progress(45)
+        progress_bar.progress(40)
         
         sla_a = pd.to_numeric(df_a_working[sla_hrs_col], errors='coerce').fillna(0)
         f2f_a = pd.to_numeric(df_a_working[f2f_hrs_col], errors='coerce').fillna(0)
@@ -326,55 +340,77 @@ if run:
         f2f_b = pd.to_numeric(df_b_working[f2f_hrs_col], errors='coerce').fillna(0)
         df_b_working[val_col] = ((sla_b - f2f_b) / 24).round(0)
 
-    # Process Chunked Engine 
-    results = process_comparison_chunked(df_a_working, df_b_working, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+    # Process and Stream directly to Disk!
+    csv_path, counts, total_rows = process_comparison_streamed(df_a_working, df_b_working, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
-    st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
+    st.session_state.update({
+        "results_path": csv_path, 
+        "status_counts": counts,
+        "total_rows": total_rows,
+        "key_cols": key_cols, 
+        "val_col": val_col, 
+        "grp_col": grp_col, 
+        "higher_is": higher_is
+    })
     
-    # Clean up working memory immediately to prevent crashes during CSV export
     del df_a_working, df_b_working
     gc.collect()
     
     status_text.empty()
     progress_bar.empty()
 
-results, key_cols, val_col, grp_col, higher_is = [st.session_state[k] for k in ["results", "key_cols", "val_col", "grp_col", "higher_is"]]
+results_path, status_counts, total_rows, key_cols, val_col, grp_col, higher_is = [
+    st.session_state[k] for k in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]
+]
 
-sc = results["Status"].value_counts()
 cols_m = st.columns(6)
-cols_m[0].metric("Total Rows", f"{len(results):,}")
+cols_m[0].metric("Total Rows Evaluated", f"{total_rows:,}")
 for i, s in enumerate(STATUS_ORDER):
-    cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{sc.get(s, 0):,}")
+    cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{status_counts.get(s, 0):,}")
 
 st.markdown("")
-tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 CSV Export"])
+tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer (Preview)", "💾 Download Full CSV Export"])
 
 with tab_data:
+    st.info("💡 **Big Data Mode:** Because your dataset contains over 20 Lakh rows, this viewer displays a random preview of the first 5,000 rows to prevent your browser from freezing. Export the CSV to view all rows.", icon="ℹ️")
+    
     fc1, fc2, fc3 = st.columns([2, 2, 1])
     status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses")
     search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
     sort_opts = ["Δ Change", f"{val_col} (File A)", f"{val_col} (File B)", "Status", "-".join(key_cols)] 
     sort_by = fc3.selectbox("Sort Data By", sort_opts)
 
-    view = results 
-    if status_filter: view = view[view["Status"].isin(status_filter)]
-    if search: view = view[view["-".join(key_cols)].astype(str).str.contains(search, case=False, na=False)] 
-    if sort_by in view.columns: view = view.sort_values(sort_by, ascending=(sort_by == "Status"), na_position="last")
-
-    st.caption(f"Showing **{len(view):,}** of **{len(results):,}** rows")
-
-    for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
-        gc_counts = grp_df["Status"].value_counts()
-        badges = "  ".join(f"{STATUS_META[s]['icon']} {s}: {gc_counts.get(s,0)}" for s in STATUS_ORDER if gc_counts.get(s, 0) > 0)
-        grp_label = "Overall Dataset" if grp_name == "All" else f"{grp_col}: {grp_name}"
+    # Load only a 5000-row preview into memory for the UI
+    try:
+        view = pd.read_csv(results_path, nrows=5000)
         
-        with st.expander(f"{grp_label} ({len(grp_df):,} rows)  |  {badges}", expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
-            show = grp_df.drop(columns=["Group"], errors="ignore")
-            st.dataframe(style_table(show.head(1500)), width="stretch", height=min(500, 45 + len(show) * 36))
-            if len(show) > 1500:
-                st.warning(f"⚠️ Showing first 1,500 rows. Please export CSV to view all {len(show):,} rows.")
+        if status_filter: view = view[view["Status"].isin(status_filter)]
+        if search: view = view[view["-".join(key_cols)].astype(str).str.contains(search, case=False, na=False)] 
+        if sort_by in view.columns: view = view.sort_values(sort_by, ascending=(sort_by == "Status"), na_position="last")
+
+        for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
+            grp_label = "Overall Dataset" if grp_name == "All" else f"{grp_col}: {grp_name}"
+            
+            with st.expander(f"Preview: {grp_label} ({len(grp_df):,} rows visible)", expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
+                show = grp_df.drop(columns=["Group"], errors="ignore")
+                st.dataframe(style_table(show), width="stretch", height=min(500, 45 + len(show) * 36))
+    except FileNotFoundError:
+        st.error("Temporary file lost. Please run the analysis again.")
 
 with tab_export:
-    st.markdown("#### Download CSV Report")
-    csv_bytes = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
-    st.download_button("⬇️ Download CSV File", data=csv_bytes, file_name=f"SLA_Report_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
+    st.markdown("#### Download Complete Report")
+    st.caption(f"This will download the entire 100% complete {total_rows:,} row dataset.")
+    
+    # Send the raw file straight from disk to the user with zero RAM overhead
+    try:
+        with open(results_path, "rb") as file:
+            st.download_button(
+                label="⬇️ Download Full CSV File", 
+                data=file, 
+                file_name=f"SLA_Report_{val_col}.csv", 
+                mime="text/csv", 
+                width="stretch", 
+                type="primary"
+            )
+    except FileNotFoundError:
+        st.error("Temporary file lost. Please run the analysis again.")
