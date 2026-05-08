@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import polars as pl
 import numpy as np
 import tempfile
 import os
@@ -31,208 +32,161 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
-    for key in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]:
+    for key in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is", "has_city"]:
         if key in st.session_state:
             del st.session_state[key]
 
-# ── Data Processing Helpers ───────────────────────────────────────────────────
-def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [str(c).strip() for c in df.columns]
-    seen = {}
-    new_cols = []
-    for c in df.columns:
-        if c in seen:
-            seen[c] += 1
-            new_cols.append(f"{c}_{seen[c]}")
-        else:
-            seen[c] = 0
-            new_cols.append(c)
-    df.columns = new_cols
+# ── Safe Disk Writer (Zero RAM Spike) ─────────────────────────────────────────
+def write_upload_to_temp(uploaded_file) -> str:
+    """Safely streams an uploaded file to disk in tiny chunks to prevent RAM crashes."""
+    _, ext = os.path.splitext(uploaded_file.name)
+    fd, temp_path = tempfile.mkstemp(suffix=ext.lower())
+    uploaded_file.seek(0)
+    with os.fdopen(fd, 'wb') as f:
+        while chunk := uploaded_file.read(8192):
+            f.write(chunk)
+    return temp_path
+
+# ── UI Preview Helpers (Pandas) ───────────────────────────────────────────────
+def clean_preview_df(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).strip().lower() for c in df.columns]
     df.dropna(how="all", inplace=True)
     df.dropna(axis=1, how="all", inplace=True)
-    
-    str_cols = df.select_dtypes(include=["object", "string"]).columns
-    for c in str_cols:
-        df[c] = df[c].str.strip()
-        # AGGRESSIVE MEMORY COMPRESSION FOR 20+ LAKH ROWS:
-        # If a string column has fewer unique values than 50% of the dataset size, compress it to a category.
-        if df[c].nunique() < (len(df) * 0.5):
-            df[c] = df[c].astype("category")
-            
-    df.replace("", np.nan, inplace=True)
     return df
 
-def normalise_col_name(name: str) -> str:
-    return str(name).strip().lower()
-
-def match_columns(cols_a: list, cols_b: list) -> dict:
-    norm_b = {normalise_col_name(c): c for c in cols_b}
-    mapping = {}
-    for ca in cols_a:
-        nb = norm_b.get(normalise_col_name(ca))
-        if nb is not None: mapping[ca] = nb
-    return mapping   
-
-def get_sheet_names(file) -> list:
-    file.seek(0)
-    xls = pd.ExcelFile(file)
-    return xls.sheet_names
-    
-def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def get_preview_data(file, file_name: str) -> pd.DataFrame:
+    """Loads a 1500-row preview using Pandas for the UI dropdowns."""
     file.seek(0)
     if file_name.lower().endswith('.parquet'): df = pd.read_parquet(file).head(1500)
-    elif file_name.lower().endswith('.xlsx'): df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=1500)
+    elif file_name.lower().endswith('.xlsx'): df = pd.read_excel(file, dtype=str, keep_default_na=False, nrows=1500)
     else: df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=1500)
-    return clean_df(df)
+    return clean_preview_df(df)
 
-def load_full_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    file.seek(0)
-    if file_name.lower().endswith('.parquet'): df = pd.read_parquet(file)
-    elif file_name.lower().endswith('.xlsx'): df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
-    else: df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
-    return clean_df(df)
+def match_columns(cols_a: list, cols_b: list) -> dict:
+    return {c: c for c in cols_a if c in cols_b}   
 
-def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
-    vals = df[col].dropna().head(sample)
+def sniff_numeric(df: pd.DataFrame, col: str) -> bool:
+    vals = df[col].dropna().head(1000)
     if vals.empty: return False
     return pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6
 
-def make_key(df, cols):
-    if len(cols) == 1: return df[cols[0]].astype(str)
-    res = df[cols[0]].astype(str)
-    for col in cols[1:]: res += "-" + df[col].astype(str)
-    return res
-
-# ── Unified Chunk Processing Engine (Direct-to-Disk Streaming) ────────────────
-def process_comparison_streamed(df_a, df_b, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None):
-    def update_ui(msg, pct):
-        if status_text: status_text.markdown(f"**⏳ {msg}**")
-        if progress_bar: progress_bar.progress(pct)
-
-    cols_a_all, cols_b_all = list(df_a.columns), list(df_b.columns)
-    common_cols = [c for c in cols_a_all if c in cols_b_all]
-    only_a = [c for c in cols_a_all if c not in cols_b_all]
-    only_b = [c for c in cols_b_all if c not in cols_a_all]
-
-    update_ui("Generating composite keys...", 45)
-    df_a["__key__"] = make_key(df_a, key_cols)
-    df_b["__key__"] = make_key(df_b, key_cols)
-
-    update_ui("Preparing memory chunks...", 50)
-    all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
+# ── Core Processing Engine (POLARS - Rust Powered) ────────────────────────────
+def process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_col, f2f_col, status_text):
     
-    CHUNK_SIZE = 25000  
-    num_chunks = max(1, len(all_keys) // CHUNK_SIZE + (1 if len(all_keys) % CHUNK_SIZE != 0 else 0))
-    
-    is_strict = "1-to-1" in comp_mode
-    dedup_a, dedup_b = True, True
-    if not is_strict:
-        if "File B" in granular_file: dedup_b = False
-        else: dedup_a = False
+    def load_pl(path):
+        if path.endswith(".parquet"): return pl.read_parquet(path)
+        return pl.read_csv(path, ignore_errors=True, infer_schema_length=10000).select(pl.all().cast(pl.Utf8))
 
-    # Create a temporary file to stream the output to disk
-    out_csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
+    status_text.markdown("**⏳ Loading files into Polars Engine...**")
+    df_a = load_pl(path_a)
+    df_b = load_pl(path_b)
     
-    status_counts = {"Degraded": 0, "Improved": 0, "Same": 0, "New": 0, "Removed": 0}
-    total_rows = 0
+    # Standardize column names to lowercase
+    df_a = df_a.rename({c: c.strip().lower() for c in df_a.columns})
+    df_b = df_b.rename({c: c.strip().lower() for c in df_b.columns})
+    
+    has_city = False
+
+    # 1. OPTIONAL FILE 3: CITY MAPPING
+    if path_c:
+        status_text.markdown("**⏳ Mapping Cities to Data...**")
+        df_c = load_pl(path_c).rename({c: c.strip().lower() for c in load_pl(path_c).columns})
+        if "city" in df_c.columns and "ph_name" in df_c.columns:
+            has_city = True
+            df_c = df_c.select(["ph_name", "city"]).unique("ph_name")
+            
+            # Left join city onto A and B where ph_name matches
+            if "ph_name" in df_a.columns: df_a = df_a.join(df_c, on="ph_name", how="left")
+            if "ph_name" in df_b.columns: df_b = df_b.join(df_c, on="ph_name", how="left")
+            
+            # Ensure city is treated as a context column to be coalesced later
+            if "city" not in key_cols:
+                if "city" not in df_a.columns: df_a = df_a.with_columns(pl.lit(None).alias("city"))
+                if "city" not in df_b.columns: df_b = df_b.with_columns(pl.lit(None).alias("city"))
+
+    # 2. COMPUTED SLA
+    if "Compute" in metric_strat:
+        status_text.markdown("**⏳ Calculating Derived SLAs...**")
+        df_a = df_a.with_columns(((pl.col(sla_col).cast(pl.Float64, strict=False) - pl.col(f2f_col).cast(pl.Float64, strict=False)) / 24).round(0).alias(val_col))
+        df_b = df_b.with_columns(((pl.col(sla_col).cast(pl.Float64, strict=False) - pl.col(f2f_col).cast(pl.Float64, strict=False)) / 24).round(0).alias(val_col))
+    else:
+        df_a = df_a.with_columns(pl.col(val_col).cast(pl.Float64, strict=False))
+        df_b = df_b.with_columns(pl.col(val_col).cast(pl.Float64, strict=False))
+
+    # 3. COMPOSITE KEYS & DEDUPLICATION
+    status_text.markdown("**⏳ Generating Keys & Deduplicating...**")
+    df_a = df_a.with_columns(pl.concat_str(key_cols, separator="-").alias("__key__"))
+    df_b = df_b.with_columns(pl.concat_str(key_cols, separator="-").alias("__key__"))
+
+    if "1-to-1" in comp_mode:
+        df_a = df_a.unique(subset=["__key__"], keep="first")
+        df_b = df_b.unique(subset=["__key__"], keep="first")
+
+    # 4. THE OUTER JOIN (Polars handles 2M rows instantly)
+    status_text.markdown("**⏳ Performing Full Comparison Join...**")
+    merged = df_a.join(df_b, on="__key__", how="full", suffix="_B")
+
+    # 5. METRICS & STATUS
+    status_text.markdown("**⏳ Calculating Statuses...**")
+    vA = pl.col(val_col)
+    vB = pl.col(f"{val_col}_B")
+    
+    merged = merged.with_columns([
+        (vB - vA).alias("Δ Change")
+    ])
+
+    deg_cond = vB > vA if higher_is == "higher_is_worse" else vB < vA
+    imp_cond = vB < vA if higher_is == "higher_is_worse" else vB > vA
+
+    merged = merged.with_columns(
+        pl.when(vA.is_null() & vB.is_not_null()).then(pl.lit("New"))
+        .when(vA.is_not_null() & vB.is_null()).then(pl.lit("Removed"))
+        .when(deg_cond).then(pl.lit("Degraded"))
+        .when(imp_cond).then(pl.lit("Improved"))
+        .otherwise(pl.lit("Same")).alias("Status")
+    )
+
+    # 6. COALESCE CONTEXT COLUMNS
+    status_text.markdown("**⏳ Finalizing Dataset...**")
+    base_cols = ["__key__", val_col, f"{val_col}_B", "Δ Change", "Status"]
+    if grp_col and grp_col != "(none)":
+        merged = merged.with_columns(pl.coalesce([pl.col(grp_col), pl.col(f"{grp_col}_B")]).fill_null("Unknown").alias("Group"))
+        base_cols.append("Group")
+    else:
+        merged = merged.with_columns(pl.lit("All").alias("Group"))
+        base_cols.append("Group")
+        
+    if has_city:
+        merged = merged.with_columns(pl.coalesce([pl.col("city"), pl.col("city_B")]).alias("city"))
+        base_cols.append("city")
+
+    # Rename for output
     key_display = "-".join(key_cols)
+    merged = merged.rename({
+        "__key__": key_display,
+        val_col: f"{val_col} (File A)",
+        f"{val_col}_B": f"{val_col} (File B)"
+    })
+    
+    final_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
+    if has_city: final_cols.append("city")
 
-    for i in range(num_chunks):
-        chunk_pct = 50 + int(45 * (i / num_chunks)) 
-        update_ui(f"Streaming chunk {i+1} of {num_chunks} to disk ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} keys)...", chunk_pct)
-        
-        chunk_keys = all_keys[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
-        sub_a = df_a[df_a["__key__"].isin(chunk_keys)].copy()
-        sub_b = df_b[df_b["__key__"].isin(chunk_keys)].copy()
-        
-        if dedup_a: sub_a = sub_a.drop_duplicates("__key__")
-        if dedup_b: sub_b = sub_b.drop_duplicates("__key__")
-        
-        merged = pd.merge(
-            sub_a.rename(columns={val_col: "_val_A"}),
-            sub_b.rename(columns={val_col: "_val_B"}),
-            on="__key__", how="outer", suffixes=("_A", "_B")
-        )
-        
-        merged["_val_A"] = pd.to_numeric(merged["_val_A"], errors="coerce")
-        merged["_val_B"] = pd.to_numeric(merged["_val_B"], errors="coerce")
-        merged["Δ Change"] = merged["_val_B"] - merged["_val_A"]
+    merged = merged.select([c for c in final_cols if c in merged.columns])
 
-        deg_cond = merged["_val_B"] > merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] < merged["_val_A"]
-        imp_cond = merged["_val_B"] < merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] > merged["_val_A"]
-        
-        merged["Status"] = np.select(
-            [merged["_val_A"].isna() & merged["_val_B"].notna(), merged["_val_A"].notna() & merged["_val_B"].isna(), deg_cond, imp_cond],
-            ["New", "Removed", "Degraded", "Improved"], default="Same"
-        )
-
-        # Dynamic Column Coalescing
-        for c in [c for c in common_cols if c not in ["__key__", val_col]]:
-            col_a, col_b = f"{c}_A", f"{c}_B"
-            if col_a in merged.columns and col_b in merged.columns:
-                if not is_strict and "File B" in granular_file: merged[c] = merged[col_b].combine_first(merged[col_a])
-                elif not is_strict: merged[c] = merged[col_a].combine_first(merged[col_b])
-                else: merged[c] = merged[col_b].combine_first(merged[col_a])
-                merged.drop(columns=[col_a, col_b], inplace=True)
-            elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
-            elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
-
-        if merged.empty:
-            continue
-
-        merged["Group"] = merged[grp_col].fillna("Unknown") if grp_col and grp_col in merged.columns else "All"
-        merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
-
-        # Column Ordering
-        base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-        all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in [key_display, val_col]]
-        context_cols = list(dict.fromkeys([c for c in all_context if c in merged.columns]))
-        
-        final_cols = [c for c in base_cols + context_cols if c in merged.columns]
-        merged = merged[final_cols]
-        
-        if not is_strict: 
-            merged = merged.drop_duplicates()
-
-        # Tally metrics dynamically without keeping data in RAM
-        sc = merged["Status"].value_counts().to_dict()
-        for s in status_counts.keys():
-            status_counts[s] += sc.get(s, 0)
-        total_rows += len(merged)
-
-        # Append directly to the disk file
-        if i == 0:
-            merged.to_csv(out_csv_path, index=False)
-        else:
-            merged.to_csv(out_csv_path, mode='a', header=False, index=False)
-        
-        del sub_a, sub_b, merged
-        gc.collect()
-
-    update_ui("Analysis Complete! 🚀", 100)
-    return out_csv_path, status_counts, total_rows
-
-# ── Styler ────────────────────────────────────────────────────────────────────
-def style_table(df: pd.DataFrame):
-    def row_style(row):
-        bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
-        text_color = STATUS_META.get(row['Status'], {}).get('color', '#1e293b')
-        return [f"background-color: {bg_color}; color: {text_color};"] * len(row)
-    df = df.copy()
-    for c in df.columns:
-        if c in ["Δ Change"] or c.endswith("(File A)") or c.endswith("(File B)"):
-            try:
-                converted = pd.to_numeric(df[c], errors="coerce")
-                if converted.notna().sum() > 0: df[c] = converted
-            except Exception: pass
-    num_fmt = {c: "{:,.4g}" for c in df.columns if pd.api.types.is_numeric_dtype(df[c])}
-    return df.style.apply(row_style, axis=1).format(num_fmt, na_rep="—").set_properties(**{"font-size": "13px", "font-weight": "500"})
+    # 7. SAVE TO DISK
+    out_parquet = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet").name
+    merged.write_parquet(out_parquet)
+    
+    status_counts = merged["Status"].value_counts().to_pandas().set_index("Status")["count"].to_dict()
+    total_rows = len(merged)
+    
+    return out_parquet, status_counts, total_rows, has_city
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("🚚 Dynamic SLA Calculator & Comparator")
-st.caption("Upload baseline and current logic datasets (Parquet/CSV). Dynamically calculate Derived SLAs and run deep comparisons.")
+st.title("🚚 Dynamic SLA Calculator & Comparator (Big Data Edition)")
+st.caption("Upload files up to 2 Million rows. Powered by Polars.")
 
 with st.container(border=True):
     st.markdown("#### 1. Upload Datasets")
@@ -240,54 +194,47 @@ with st.container(border=True):
     with c1:
         st.markdown("**📁 File A — Baseline / Previous**")
         up_a = st.file_uploader("File A", type=["csv", "xlsx", "parquet"], key="fa", label_visibility="collapsed", on_change=reset_computation)
-        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
     with c2:
         st.markdown("**📁 File B — Current / New**")
         up_b = st.file_uploader("File B", type=["csv", "xlsx", "parquet"], key="fb", label_visibility="collapsed", on_change=reset_computation)
-        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
+    
+    st.markdown("---")
+    st.markdown("**📁 File 3 (Optional) — City Mapping**")
+    st.caption("Upload a file with `ph_name` and `city` columns to append City data for post-analysis filtering.")
+    up_c = st.file_uploader("File 3", type=["csv", "xlsx", "parquet"], key="fc", label_visibility="collapsed", on_change=reset_computation)
 
 if not (up_a and up_b):
-    st.info("⬆ Upload both files to configure your SLA comparison.", icon="ℹ️")
+    st.info("⬆ Upload File A and File B to begin.", icon="ℹ️")
     st.stop()
 
 with st.spinner("Extracting headers..."):
-    df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
-    df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
+    df_a_preview = get_preview_data(up_a, up_a.name)
+    df_b_preview = get_preview_data(up_b, up_b.name)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
 
 if not common:
-    st.error("No matching columns found between the two files. Please verify headers.")
+    st.error("No matching columns found between File A and File B.")
     st.stop()
 
 with st.container(border=True):
     st.markdown("#### 2. Configure Metric & Logic")
-    st.markdown("##### Step 2A: Metric Strategy")
-    metric_strat = st.radio(
-        "Choose how you want to evaluate the SLA:",
-        ["Compare an existing column", "Compute Derived SLA (Days) -> Formula: Round((Total SLA Hrs - F2F Hrs) / 24, 0)"],
-        index=0, on_change=reset_computation
-    )
+    metric_strat = st.radio("Choose how you want to evaluate the SLA:", ["Compare an existing column", "Compute Derived SLA (Days) -> Formula: Round((Total SLA - F2F) / 24, 0)"], on_change=reset_computation)
     
-    numeric_cols = [c for c in common if sniff_numeric(df_a_preview, c) or sniff_numeric(df_b_preview, col_map[c])]
+    numeric_cols = [c for c in common if sniff_numeric(df_a_preview, c)]
     
-    if "Compute Derived SLA" in metric_strat:
+    if "Compute" in metric_strat:
         mc1, mc2, mc3 = st.columns(3)
-        sla_hrs_col = mc1.selectbox("⏱️ Select Total SLA Hours Col", options=numeric_cols or common, on_change=reset_computation)
-        f2f_hrs_col = mc2.selectbox("🛑 Select F2F / Buffer Hours Col", options=numeric_cols or common, index=min(1, len(numeric_cols)-1), on_change=reset_computation)
-        val_col = mc3.text_input("✏️ Name for Computed Column", value="Computed_SLA_Days", on_change=reset_computation)
+        sla_hrs_col = mc1.selectbox("⏱️ Total SLA Hours Col", options=numeric_cols or common, on_change=reset_computation)
+        f2f_hrs_col = mc2.selectbox("🛑 F2F / Buffer Hours Col", options=numeric_cols or common, index=min(1, len(numeric_cols)-1), on_change=reset_computation)
+        val_col = mc3.text_input("✏️ Name for Computed Column", value="computed_sla_days", on_change=reset_computation).lower()
     else:
-        val_col = st.selectbox("📐 Metric to Compare", options=[c for c in numeric_cols] or common, on_change=reset_computation)
+        val_col = st.selectbox("📐 Metric to Compare", options=numeric_cols or common, on_change=reset_computation)
 
     st.markdown("---")
-    st.markdown("##### Step 2B: Match Architecture")
     mode_c1, mode_c2 = st.columns(2)
     comp_mode = mode_c1.radio("⚙️ Match Architecture", ["Strict 1-to-1 (Deduplicate Both)", "1-to-Many (Broadcast granular rows)"], index=0, on_change=reset_computation)
-    
-    granular_file = None
-    if "1-to-Many" in comp_mode:
-        granular_file = mode_c2.selectbox("📌 Which file contains the granular data?", ["File B (Current/New)", "File A (Baseline/Previous)"], on_change=reset_computation)
     
     st.markdown("---")
     cfg1, cfg2 = st.columns(2)
@@ -297,11 +244,7 @@ with st.container(border=True):
         grp_sel = st.selectbox("🗂 Group By (Optional)", options=["(none)"] + [c for c in common if c != val_col], on_change=reset_computation)
         grp_col = None if grp_sel == "(none)" else grp_sel
 
-    higher_is = st.radio(
-        "📈 Value direction meaning", options=["higher_is_worse", "higher_is_better"],
-        index=0, format_func=lambda x: "⬆ Higher = Worse" if x == "higher_is_worse" else "⬆ Higher = Better",
-        horizontal=True, on_change=reset_computation
-    )
+    higher_is = st.radio("📈 Value direction meaning", options=["higher_is_worse", "higher_is_better"], format_func=lambda x: "⬆ Higher = Worse" if x == "higher_is_worse" else "⬆ Higher = Better", horizontal=True, on_change=reset_computation)
 
     run_disabled = not key_cols or (metric_strat.startswith("Compute") and (not sla_hrs_col or not f2f_hrs_col or not val_col))
     run = st.button("🚀 Run Full Analysis", type="primary", width="stretch", disabled=run_disabled)
@@ -312,56 +255,25 @@ if not run and "results_path" not in st.session_state:
 if run:
     st.markdown("---")
     status_text = st.empty()
-    progress_bar = st.progress(0)
     
-    # Load A and explicit memory clearing
-    status_text.markdown(f"**⏳ Reading {up_a.name} into memory and compressing...**")
-    progress_bar.progress(10)
-    df_a_working = load_full_data(up_a, up_a.name, sheet_a)
-    gc.collect() 
-    
-    # Load B and explicit memory clearing
-    status_text.markdown(f"**⏳ Reading {up_b.name} into memory and compressing...**")
-    progress_bar.progress(25)
-    df_b_working = load_full_data(up_b, up_b.name, sheet_b)
-    gc.collect()
+    # Write to disk to protect RAM
+    status_text.markdown("**⏳ Securing files to disk to prevent RAM overflow...**")
+    path_a = write_upload_to_temp(up_a)
+    path_b = write_upload_to_temp(up_b)
+    path_c = write_upload_to_temp(up_c) if up_c else None
 
-    df_b_working.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
+    # Run Polars Engine
+    out_path, counts, total, has_city = process_with_polars(path_a, path_b, path_c, comp_mode, key_cols, val_col, grp_col, higher_is, metric_strat, sla_hrs_col if "Compute" in metric_strat else None, f2f_hrs_col if "Compute" in metric_strat else None, status_text)
+        
+    st.session_state.update({"results_path": out_path, "status_counts": counts, "total_rows": total, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is, "has_city": has_city})
     
-    if "Compute Derived SLA" in metric_strat:
-        status_text.markdown(f"**⏳ Computing {val_col}...**")
-        progress_bar.progress(40)
-        
-        sla_a = pd.to_numeric(df_a_working[sla_hrs_col], errors='coerce').fillna(0)
-        f2f_a = pd.to_numeric(df_a_working[f2f_hrs_col], errors='coerce').fillna(0)
-        df_a_working[val_col] = ((sla_a - f2f_a) / 24).round(0)
-        
-        sla_b = pd.to_numeric(df_b_working[sla_hrs_col], errors='coerce').fillna(0)
-        f2f_b = pd.to_numeric(df_b_working[f2f_hrs_col], errors='coerce').fillna(0)
-        df_b_working[val_col] = ((sla_b - f2f_b) / 24).round(0)
-
-    # Process and Stream directly to Disk!
-    csv_path, counts, total_rows = process_comparison_streamed(df_a_working, df_b_working, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
-        
-    st.session_state.update({
-        "results_path": csv_path, 
-        "status_counts": counts,
-        "total_rows": total_rows,
-        "key_cols": key_cols, 
-        "val_col": val_col, 
-        "grp_col": grp_col, 
-        "higher_is": higher_is
-    })
-    
-    del df_a_working, df_b_working
+    # Cleanup temp raw files
+    os.remove(path_a); os.remove(path_b)
+    if path_c: os.remove(path_c)
     gc.collect()
-    
     status_text.empty()
-    progress_bar.empty()
 
-results_path, status_counts, total_rows, key_cols, val_col, grp_col, higher_is = [
-    st.session_state[k] for k in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is"]
-]
+results_path, status_counts, total_rows, key_cols, val_col, grp_col, higher_is, has_city = [st.session_state[k] for k in ["results_path", "status_counts", "total_rows", "key_cols", "val_col", "grp_col", "higher_is", "has_city"]]
 
 cols_m = st.columns(6)
 cols_m[0].metric("Total Rows Evaluated", f"{total_rows:,}")
@@ -369,48 +281,49 @@ for i, s in enumerate(STATUS_ORDER):
     cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{status_counts.get(s, 0):,}")
 
 st.markdown("")
-tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer (Preview)", "💾 Download Full CSV Export"])
+tab_data, tab_export = st.tabs(["📋 Viewer (Preview Mode)", "💾 Filter & Download CSV"])
 
 with tab_data:
-    st.info("💡 **Big Data Mode:** Because your dataset contains over 20 Lakh rows, this viewer displays a random preview of the first 5,000 rows to prevent your browser from freezing. Export the CSV to view all rows.", icon="ℹ️")
-    
-    fc1, fc2, fc3 = st.columns([2, 2, 1])
-    status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses")
-    search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
-    sort_opts = ["Δ Change", f"{val_col} (File A)", f"{val_col} (File B)", "Status", "-".join(key_cols)] 
-    sort_by = fc3.selectbox("Sort Data By", sort_opts)
-
-    # Load only a 5000-row preview into memory for the UI
+    st.info("💡 **Big Data Mode:** Showing a 1,000-row preview to prevent browser freezing.", icon="ℹ️")
     try:
-        view = pd.read_csv(results_path, nrows=5000)
-        
-        if status_filter: view = view[view["Status"].isin(status_filter)]
-        if search: view = view[view["-".join(key_cols)].astype(str).str.contains(search, case=False, na=False)] 
-        if sort_by in view.columns: view = view.sort_values(sort_by, ascending=(sort_by == "Status"), na_position="last")
-
-        for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
-            grp_label = "Overall Dataset" if grp_name == "All" else f"{grp_col}: {grp_name}"
-            
-            with st.expander(f"Preview: {grp_label} ({len(grp_df):,} rows visible)", expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
-                show = grp_df.drop(columns=["Group"], errors="ignore")
-                st.dataframe(style_table(show), width="stretch", height=min(500, 45 + len(show) * 36))
-    except FileNotFoundError:
-        st.error("Temporary file lost. Please run the analysis again.")
+        view = pd.read_parquet(results_path).head(1000)
+        st.dataframe(view, width="stretch")
+    except Exception as e:
+        st.error("Error loading preview.")
 
 with tab_export:
-    st.markdown("#### Download Complete Report")
-    st.caption(f"This will download the entire 100% complete {total_rows:,} row dataset.")
+    st.markdown("#### Extract & Download Data")
     
-    # Send the raw file straight from disk to the user with zero RAM overhead
     try:
-        with open(results_path, "rb") as file:
-            st.download_button(
-                label="⬇️ Download Full CSV File", 
-                data=file, 
-                file_name=f"SLA_Report_{val_col}.csv", 
-                mime="text/csv", 
-                width="stretch", 
-                type="primary"
-            )
-    except FileNotFoundError:
-        st.error("Temporary file lost. Please run the analysis again.")
+        # Load the massive dataset lazily to prevent RAM spike during export prep
+        lazy_df = pl.scan_parquet(results_path)
+        
+        # City Filter UI (Only shows if File 3 was uploaded and matched successfully)
+        selected_cities = []
+        if has_city:
+            unique_cities = lazy_df.select("city").drop_nulls().unique().collect().to_series().to_list()
+            unique_cities = sorted([str(c) for c in unique_cities])
+            
+            st.markdown("**🏙️ Filter Output by City**")
+            selected_cities = st.multiselect("Select Cities to include (Leave empty to download ALL rows):", options=unique_cities)
+        
+        # Generate the final CSV string dynamically based on the filter
+        if st.button("🔄 Generate CSV File for Download"):
+            with st.spinner("Preparing your CSV..."):
+                if selected_cities:
+                    final_export = lazy_df.filter(pl.col("city").is_in(selected_cities)).collect()
+                else:
+                    final_export = lazy_df.collect()
+                    
+                csv_bytes = final_export.write_csv().encode('utf-8')
+                
+                st.download_button(
+                    label=f"⬇️ Download Output ({len(final_export):,} rows)", 
+                    data=csv_bytes, 
+                    file_name=f"SLA_Report_Filtered.csv", 
+                    mime="text/csv", 
+                    type="primary"
+                )
+                
+    except Exception as e:
+        st.error(f"Error accessing output: {e}")
