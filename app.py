@@ -70,19 +70,10 @@ def get_sheet_names(file) -> list:
     file.seek(0)
     xls = pd.ExcelFile(file)
     return xls.sheet_names
-
-def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    file.seek(0)
-    if file_name.lower().endswith('.parquet'):
-        df = pd.read_parquet(file).head(2000)
-    elif file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
-    else:
-        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
-    return clean_df(df)
-
-def load_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    file.seek(0)
+    
+@st.cache_data(show_spinner=False)
+def load_cached_data(file_bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    file = BytesIO(file_bytes)
     if file_name.lower().endswith('.parquet'):
         df = pd.read_parquet(file)
     elif file_name.lower().endswith('.xlsx'):
@@ -90,6 +81,7 @@ def load_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
     else:
         df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
+
 
 def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
     vals = df[col].dropna().head(sample)
@@ -121,7 +113,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
     update_ui("Preparing memory chunks...", 60)
     all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
     
-    CHUNK_SIZE = 50000 
+    CHUNK_SIZE = 40000 
     num_chunks = max(1, len(all_keys) // CHUNK_SIZE + (1 if len(all_keys) % CHUNK_SIZE != 0 else 0))
     
     processed_chunks = []
@@ -229,10 +221,14 @@ with st.container(border=True):
 if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your SLA comparison.", icon="ℹ️")
     st.stop()
-
-with st.spinner("Extracting headers and detecting data types..."):
-    df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
-    df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
+with st.spinner("Extracting headers and caching data in memory..."):
+    # Loads the full files ONCE. Reruns will now take 0.01 seconds.
+    df_a_full = load_cached_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_b_full = load_cached_data(up_b.getvalue(), up_b.name, sheet_b)
+    
+    # Generate previews instantly from the cached data
+    df_a_preview = df_a_full.head(2000)
+    df_b_preview = df_b_full.head(2000)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
@@ -288,38 +284,40 @@ with st.container(border=True):
 
 if not run and "results" not in st.session_state:
     st.stop()
-
 if run:
     st.markdown("---")
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**")
-    progress_bar.progress(10)
-    df_a_full = load_data(up_a, up_a.name, sheet_a)
-    
-    status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**")
-    progress_bar.progress(35)
-    df_b_full = load_data(up_b, up_b.name, sheet_b)
+    # 1. Create working copies so we don't corrupt the cached memory
+    df_a_working = df_a_full.copy()
+    df_b_working = df_b_full.copy()
 
-    df_b_full.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
+    # 2. Map File B columns
+    df_b_working.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
     
+    # 3. Inject the custom Computed Metric if selected
     if "Compute Derived SLA" in metric_strat:
         status_text.markdown(f"**⏳ Computing {val_col}...**")
         progress_bar.progress(45)
-        sla_a = pd.to_numeric(df_a_full[sla_hrs_col], errors='coerce').fillna(0)
-        f2f_a = pd.to_numeric(df_a_full[f2f_hrs_col], errors='coerce').fillna(0)
-        df_a_full[val_col] = ((sla_a - f2f_a) / 24).round(0)
         
-        sla_b = pd.to_numeric(df_b_full[sla_hrs_col], errors='coerce').fillna(0)
-        f2f_b = pd.to_numeric(df_b_full[f2f_hrs_col], errors='coerce').fillna(0)
-        df_b_full[val_col] = ((sla_b - f2f_b) / 24).round(0)
+        sla_a = pd.to_numeric(df_a_working[sla_hrs_col], errors='coerce').fillna(0)
+        f2f_a = pd.to_numeric(df_a_working[f2f_hrs_col], errors='coerce').fillna(0)
+        df_a_working[val_col] = ((sla_a - f2f_a) / 24).round(0)
+        
+        sla_b = pd.to_numeric(df_b_working[sla_hrs_col], errors='coerce').fillna(0)
+        f2f_b = pd.to_numeric(df_b_working[f2f_hrs_col], errors='coerce').fillna(0)
+        df_b_working[val_col] = ((sla_b - f2f_b) / 24).round(0)
 
-    results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+    # 4. Process Chunked Engine (Using our safe working copies)
+    results = process_comparison_chunked(df_a_working, df_b_working, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+        
     st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
     
-    del df_a_full, df_b_full
+    # 5. Clean up working memory
+    del df_a_working, df_b_working
     gc.collect()
+    
     status_text.empty()
     progress_bar.empty()
 
