@@ -5,7 +5,7 @@ from io import BytesIO
 import gc
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Dynamic SLA Calculator & Comparator", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="Dynamic SLA Comparator", page_icon="🚚", layout="wide")
 
 st.markdown("""
 <style>
@@ -71,8 +71,19 @@ def get_sheet_names(file) -> list:
     xls = pd.ExcelFile(file)
     return xls.sheet_names
     
-@st.cache_data(show_spinner=False)
-def load_cached_data(file_bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def get_preview_data(file_bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    """Loads just a tiny chunk of data to populate the UI dropdowns quickly."""
+    file = BytesIO(file_bytes)
+    if file_name.lower().endswith('.parquet'):
+        df = pd.read_parquet(file).head(1500)
+    elif file_name.lower().endswith('.xlsx'):
+        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=1500)
+    else:
+        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=1500)
+    return clean_df(df)
+
+def load_full_data(file_bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    """Loads the full dataset ONLY when the user clicks 'Run Analysis'."""
     file = BytesIO(file_bytes)
     if file_name.lower().endswith('.parquet'):
         df = pd.read_parquet(file)
@@ -113,7 +124,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
     update_ui("Preparing memory chunks...", 60)
     all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
     
-    CHUNK_SIZE = 40000 
+    CHUNK_SIZE = 25000  # Lowered for safety to prevent RAM spikes on cloud server
     num_chunks = max(1, len(all_keys) // CHUNK_SIZE + (1 if len(all_keys) % CHUNK_SIZE != 0 else 0))
     
     processed_chunks = []
@@ -185,7 +196,8 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, key_cols, v
     return final_merged[[c for c in base_cols + context_cols if c in final_merged.columns]]
 
 # ── Styler ────────────────────────────────────────────────────────────────────
-def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+# Removed the pd.io.formats type hint to prevent AttributeError
+def style_table(df: pd.DataFrame):
     def row_style(row):
         bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
         text_color = STATUS_META.get(row['Status'], {}).get('color', '#1e293b')
@@ -221,14 +233,11 @@ with st.container(border=True):
 if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your SLA comparison.", icon="ℹ️")
     st.stop()
-with st.spinner("Extracting headers and caching data in memory..."):
-    # Loads the full files ONCE. Reruns will now take 0.01 seconds.
-    df_a_full = load_cached_data(up_a.getvalue(), up_a.name, sheet_a)
-    df_b_full = load_cached_data(up_b.getvalue(), up_b.name, sheet_b)
-    
-    # Generate previews instantly from the cached data
-    df_a_preview = df_a_full.head(2000)
-    df_b_preview = df_b_full.head(2000)
+
+with st.spinner("Extracting headers..."):
+    # Generate previews instantly using minimal memory
+    df_a_preview = get_preview_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_b_preview = get_preview_data(up_b.getvalue(), up_b.name, sheet_b)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
@@ -284,14 +293,20 @@ with st.container(border=True):
 
 if not run and "results" not in st.session_state:
     st.stop()
+
 if run:
     st.markdown("---")
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    # 1. Create working copies so we don't corrupt the cached memory
-    df_a_working = df_a_full.copy()
-    df_b_working = df_b_full.copy()
+    # 1. Load the full datasets ONLY now that the user has clicked run
+    status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**")
+    progress_bar.progress(10)
+    df_a_working = load_full_data(up_a.getvalue(), up_a.name, sheet_a)
+    
+    status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**")
+    progress_bar.progress(35)
+    df_b_working = load_full_data(up_b.getvalue(), up_b.name, sheet_b)
 
     # 2. Map File B columns
     df_b_working.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
@@ -309,12 +324,12 @@ if run:
         f2f_b = pd.to_numeric(df_b_working[f2f_hrs_col], errors='coerce').fillna(0)
         df_b_working[val_col] = ((sla_b - f2f_b) / 24).round(0)
 
-    # 4. Process Chunked Engine (Using our safe working copies)
+    # 4. Process Chunked Engine 
     results = process_comparison_chunked(df_a_working, df_b_working, comp_mode, granular_file, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
     st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
     
-    # 5. Clean up working memory
+    # 5. Clean up working memory immediately to prevent crashes during CSV export
     del df_a_working, df_b_working
     gc.collect()
     
